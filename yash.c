@@ -84,6 +84,9 @@ int main(int argc, char *argv[]) {
 
   // main loop
   char line[256], cmd[300], buf[1024];
+  bool busy = false;
+  char prev = 0, last = 0;
+
   while (1) {
     if (poll(fds, 2, -1) == -1) {
       if (errno == EINTR)
@@ -99,13 +102,36 @@ int main(int argc, char *argv[]) {
         break;
       fwrite(buf, 1, n, stdout);
       fflush(stdout);
+      // handle a prompt split across two recv calls
+      for (ssize_t i = 0; i < n; i++) {
+        prev = last;
+        last = buf[i];
+      }
+      if (prev == '\n' && last == '#')
+        busy = false;
     }
 
-    // send loop
+    // keyboard loop
     if (fds[0].revents & POLLIN) {
       // get stdin and check for Ctrl-D (NULL)
-      if (fgets(line, sizeof line, stdin) == NULL)
-        break;
+      if (fgets(line, sizeof line, stdin) == NULL) {
+        if (!busy)
+          break;
+        // CTRL-D while a command runs
+        clearerr(stdin);
+        if (send_all(server_fd, "CTL d\n", 6) == -1) {
+          perror("send");
+          exit(EXIT_FAILURE);
+        }
+        continue;
+      }
+      if (busy) {
+        if (send_all(server_fd, line, strlen(line)) == -1) {
+          perror("send");
+          exit(EXIT_FAILURE);
+        }
+        continue;
+      }
       // drop the newline
       line[strcspn(line, "\n")] = '\0';
       if (strcmp(line, "quit") == 0)
@@ -116,8 +142,10 @@ int main(int argc, char *argv[]) {
         perror("send");
         exit(EXIT_FAILURE);
       }
+      busy = true;
     }
   }
 
+  printf("\n");
   close(server_fd);
 }
