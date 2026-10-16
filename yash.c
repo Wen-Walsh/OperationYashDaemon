@@ -23,8 +23,23 @@ static void on_sigtstp(int sig) {
   send(sock, "CTL z\n", 6, MSG_NOSIGNAL);
 }
 
-int main(int argc, char *argv[]) {
+// send every byte of the message, even send() writes only part
+static int send_all(int fd, const char *data, size_t length) {
+  size_t sent = 0;
+  while (sent < length) {
+    ssize_t n = send(fd, data + sent, length - sent, MSG_NOSIGNAL);
+    if (n > 0) {
+      sent += (size_t)n;
+    } else if (n == -1 && errno == EINTR) {
+      continue;
+    } else {
+      return -1;
+    }
+  }
+  return 0;
+}
 
+int main(int argc, char *argv[]) {
   if (argc != 2) {
     fprintf(stderr, "usage: %s <ip>\n", argv[0]);
     exit(1);
@@ -97,17 +112,9 @@ int main(int argc, char *argv[]) {
         break;
       // send
       int len = snprintf(cmd, sizeof cmd, "CMD %s\n", line);
-      int sent = 0;
-      while (sent < len) {
-        ssize_t n = send(server_fd, cmd + sent, len - sent, MSG_NOSIGNAL);
-        if (n == -1 && errno == EINTR) {
-          continue;
-        }
-        if (n == -1) {
-          perror("send");
-          exit(EXIT_FAILURE);
-        }
-        sent += n;
+      if (send_all(server_fd, cmd, len) == -1) {
+        perror("send");
+        exit(EXIT_FAILURE);
       }
     }
   }
