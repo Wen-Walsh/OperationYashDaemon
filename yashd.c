@@ -18,6 +18,11 @@
 
 typedef struct {
 	pid_t pid;
+	pid_t right_pid;
+	bool left_finished;
+	bool right_finished;
+	bool left_stopped;
+	bool right_stopped;
 	int job_id;
 	bool stopped;
 	bool running;
@@ -47,12 +52,10 @@ static int send_prompt(int fd) {
 	return send_all(fd, "\n#", 2);
 }
 
-static void wait_for_child(pid_t pid) {
-	while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {
-	}
-}
+static bool job_done(const job_t *job);
+static void reap_job(job_t *job);
 
-static int wait_for_child_poll(pid_t pid, pid_t pgid, int client_fd, int stdin_fd) {
+static int wait_for_child_poll(job_t *job, int client_fd, int stdin_fd) {
 	int status;
 	int stopped = 0;
 	int wait_error = 0;
@@ -65,22 +68,47 @@ static int wait_for_child_poll(pid_t pid, pid_t pgid, int client_fd, int stdin_f
 	};
 
 	while (1) {
-		pid_t result = waitpid(pid, &status, WNOHANG | WUNTRACED);
+		pid_t result = waitpid(-job->pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
 
-		if (result == pid) {
+		if (result > 0) {
+			bool *finished = result == job->pid ? &job->left_finished : &job->right_finished;
+			bool *stopped_flag = result == job->pid ? &job->left_stopped : &job->right_stopped;
+
 			if (WIFEXITED(status) || WIFSIGNALED(status)) {
-				break;
+				*finished = true;
+				*stopped_flag = false;
 			}
-			if (WIFSTOPPED(status)) {
-				stopped = 1; //child stopped
-				break;
+			else if (WIFSTOPPED(status)) {
+				*stopped_flag = true;
 			}
-		} else if (result == -1) {
+			else if (WIFCONTINUED(status)) {
+				*stopped_flag = false;
+			}
+		}
+		else if (result == -1) {
 			if (errno == EINTR) {
 				continue;
 			}
-			perror("waitpid");
-			wait_error = 1;
+
+			if (errno == ECHILD) {
+				job->left_finished = true;
+				job->right_finished = true;
+			}
+			else {
+				perror("waitpid");
+				wait_error = 1;
+				break;
+			}
+		}
+
+		//Both children completed
+		if (job_done(job)) {
+			break;
+		}
+
+		//all remaining children are stopped
+		if ((job->left_finished || job->left_stopped) && (job->right_finished || job->right_stopped)) {
+			stopped = 1;
 			break;
 		}
 
@@ -110,13 +138,13 @@ static int wait_for_child_poll(pid_t pid, pid_t pgid, int client_fd, int stdin_f
 						size_t len = i - start;
 
 		if (len == 5 && memcmp(control_buffer + start, "CTL c", 5) == 0) {
-							if (pgid > 0) {
-								kill(-pgid, SIGINT);
+							if (job->pid > 0) {
+								kill(-job->pid, SIGINT);
 							}
 						}
 						else if (len == 5 && memcmp(control_buffer + start, "CTL z", 5) == 0) {
-							if (pgid > 0) {
-								kill(-pgid, SIGTSTP);
+							if (job->pid > 0) {
+								kill(-job->pid, SIGTSTP);
 							}
 						}
 
@@ -155,24 +183,14 @@ static int wait_for_child_poll(pid_t pid, pid_t pgid, int client_fd, int stdin_f
 
 			}
 			else if (n==0) {
-				//client disconnected, child completion not confirmed
+				//kill and reap the entire fg job
 				wait_error = 1;
 
-				if (pgid > 0) {
-					kill(-pgid, SIGKILL);
-				}
-				
-				//reap the child so it doesn't become a zombie!!
-				while (waitpid(pid, NULL, 0) == -1) {
-					if (errno == EINTR) {
-						continue;
-					}
-					if (errno != ECHILD) {
-						perror("foreground cleanup waitpid");
-					}
-					break;
+				if (job->pid > 0) {
+					kill(-job->pid, SIGKILL);
 				}
 
+				reap_job(job);
 				break;
 			}
 			else if (errno != EINTR) {
@@ -188,6 +206,71 @@ static int wait_for_child_poll(pid_t pid, pid_t pgid, int client_fd, int stdin_f
 	}
 	return wait_error ? -1 : stopped;
 }
+
+//Job management helpers which determine when a job is completed 
+static void refresh_job(job_t *job) {
+	pid_t children[2] = {job->pid, job ->right_pid};
+
+	bool *finished[2] = {
+		&job->left_finished,
+		&job->right_finished
+	};
+
+	bool *stopped[2] = {
+		&job->left_stopped,
+		&job->right_stopped
+	};
+
+	for (int i=0; i<2; i++) {
+		if (children[i] == 0 || *finished[i])
+			continue;
+		int status;
+		pid_t result;
+
+		do {
+			result = waitpid(children[i], &status, WNOHANG | WUNTRACED | WCONTINUED);
+		} while (result == -1 && errno == EINTR);
+
+		if (result == children[i]) {
+			if (WIFEXITED(status) || WIFSIGNALED(status)) {
+				*finished[i] = true;
+				*stopped[i] = false;
+			}
+
+			else if (WIFSTOPPED(status)) {
+				*stopped[i] = true;
+			}
+					
+		}
+		else if (result == -1 && errno == ECHILD) {
+			*finished[i] = true;
+		}
+	}
+	job->running = !((job->left_finished || job->left_stopped) && (job->right_finished || job->right_stopped));
+	job->stopped = !job->running && !(job->left_finished && job->right_finished);
+}
+
+static bool job_done(const job_t *job) {
+	return job->left_finished && job->right_finished;
+}
+
+static void reap_job(job_t *job) {
+	if (!job->left_finished) {
+		while (waitpid(job->pid, NULL, 0) == -1 && errno == EINTR) {
+			
+		}
+		job->left_finished = true;
+	}
+
+	if (job->right_pid > 0 && !job->right_finished) {
+		while (waitpid(job->right_pid, NULL, 0) == -1 && errno == EINTR) {
+		
+		}
+		job->right_finished = true;
+
+	}
+}
+
 
 void *handle_client(void *arg) {
 	int client_fd = *(int *)arg;
@@ -211,23 +294,14 @@ void *handle_client(void *arg) {
 
 		//This block only runs when the handler reaches the main receive loop. Thread blocked inside fg won't perform cleanup until it returns
 		for (int j = job_count - 1; j >= 0; j--) {
-			if (!jobs[j].running) {
-				continue;
-			}
-		
+			refresh_job(&jobs[j]);
 
-			int status;
-			pid_t result = waitpid(jobs[j].pid, &status, WNOHANG);
-
-			if (result == jobs[j].pid) {
-				if (WIFEXITED(status) || WIFSIGNALED(status)) {
-					for (int k = j; k < job_count - 1; k++) {
-						jobs[k] = jobs[k+1];
-					}
-					job_count--;
+			if (job_done(&jobs[j])) {
+				for (int k = j; k < job_count - 1; k++) {
+					jobs[k] = jobs[k + 1];
 				}
-			} else if (result == -1 && errno != EINTR) {
-				perror("background waitpid");
+
+				job_count--;
 			}
 		}
 		//Making serer check periodically on background children even if client isn't receiving commands
@@ -276,22 +350,13 @@ void *handle_client(void *arg) {
 						//Checks whether the command is jobs
 						if (strcmp(actual_command, "jobs") == 0) {
 							for (int j = job_count - 1; j >= 0; j--) {
-								if (!jobs[j].running) {
-									continue;
-								}
+								refresh_job(&jobs[j]);
 
-								int status;
-								pid_t result = waitpid(jobs[j].pid, &status, WNOHANG);
-
-								if (result == jobs[j].pid) {
-									if (WIFEXITED(status) || WIFSIGNALED(status)) {
-										for (int k = j; k < job_count -1; k++) {
-											jobs[k] = jobs[k+1];
-										}
-										job_count--;
+								if (job_done(&jobs[j])) {
+									for (int k = j; k < job_count - 1; k++) {
+										jobs[k] = jobs[k + 1];
 									}
-								} else if (result == -1) {
-									perror("background waitpid");
+									job_count--;
 								}
 							}
 
@@ -378,21 +443,23 @@ void *handle_client(void *arg) {
 									goto client_cleanup;
 								}
 							} else {
-								int fg_result = wait_for_child_poll(target_pid, target_pid, client_fd, -1);
+								jobs[job_index].left_stopped = false;
+								jobs[job_index].right_stopped = false;
+
+								int fg_result = wait_for_child_poll(&jobs[job_index], client_fd, -1);
 
 								if (fg_result == -1) {
 									goto client_cleanup;
 								}
-
 								if (fg_result == 1) {
-									//Child stopped again
 									jobs[job_index].stopped = true;
 									jobs[job_index].running = false;
-									jobs[job_index].recency = ++recency_counter;
-								} else if (fg_result == 0) {
-									//child exited or terminated, remove from job table
+									jobs[job_index].recency = ++recency_counter; 
+								}
+								else {
+									// entire job completed
 									for (int j = job_index; j < job_count - 1; j++) {
-										jobs[j] =jobs[j+1];
+										jobs[j] = jobs[j+1];
 									}
 									job_count--;
 								}
@@ -453,6 +520,9 @@ void *handle_client(void *arg) {
 									goto client_cleanup;
 								}
 							} else {
+								//stopped status for both children
+								jobs[job_index].left_stopped = false;
+								jobs[job_index].right_stopped = false;
 								jobs[job_index].stopped = false;
 								jobs[job_index].running = true;
 								jobs[job_index].recency = ++recency_counter;
@@ -496,6 +566,18 @@ void *handle_client(void *arg) {
 								goto client_cleanup;
 							}
 
+							command_len = 0;
+							continue;
+						}
+						//stop from writing beyond max jobs
+						if (background && job_count >= MAX_JOBS) {
+							if (send_all(client_fd, "Job limit reached \n", strlen("Job limit reached\n")) == -1) {
+								goto client_cleanup;
+							}
+							if (send_prompt(client_fd) == -1) {
+								goto client_cleanup;
+							}
+							
 							command_len = 0;
 							continue;
 						}
@@ -643,8 +725,11 @@ void *handle_client(void *arg) {
 										perror("fork");
 										close(pipefd[0]);
 										close(pipefd[1]);
-										kill(left_pid, SIGTERM);
-										waitpid(left_pid, NULL, 0);
+										
+										kill(-left_pid, SIGKILL);
+
+										while(waitpid(left_pid, NULL, 0) == -1 && errno == EINTR) {
+										}
 									}
 									else if (right_pid == 0) {
 										struct sigaction child_sa = {0};
@@ -687,7 +772,21 @@ void *handle_client(void *arg) {
 											}
 											close(fd);
 										}
-										
+										if (right_output_file != NULL) {
+											int fd = open(right_output_file, O_WRONLY | O_CREAT | O_TRUNC,  0644);
+
+											if (fd < 0) {
+												perror("open");
+												_exit(1);
+											}
+
+											if (dup2(fd, STDOUT_FILENO) == -1) {
+												perror("dup2");
+												_exit(1);
+											}
+
+											close(fd);
+										}
 										execvp(right_argv[0], right_argv);
 										perror("execvp");
 										_exit(127);
@@ -702,9 +801,42 @@ void *handle_client(void *arg) {
 										close(pipefd[0]);
 										close(pipefd[1]);
 
-										//Wait for both commands to finish
-										wait_for_child(left_pid);
-										wait_for_child(right_pid);
+										//Block waits on the updating wait_for_child_poll() to acept job and track full proess group
+										job_t pipeline_job = {0};
+
+										pipeline_job.pid = left_pid;
+										pipeline_job.right_pid = right_pid;
+										pipeline_job.running = true;
+										pipeline_job.recency = ++recency_counter;
+
+										snprintf(pipeline_job.command, sizeof(pipeline_job.command), "%s", original_command);
+
+										if (background) {
+											pipeline_job.job_id = next_job_id++;
+											jobs[job_count++] = pipeline_job;
+										}
+										else {
+											int result = wait_for_child_poll(&pipeline_job, client_fd, -1);
+
+											if (result == -1) {
+												kill(-left_pid, SIGKILL);
+												reap_job(&pipeline_job);
+												goto client_cleanup;
+											}
+
+											if (result == 1) {
+												if (job_count < MAX_JOBS) {
+													pipeline_job.job_id = next_job_id++;
+													pipeline_job.stopped = true;
+													pipeline_job.running = false;
+													jobs[job_count++] = pipeline_job;
+												}
+												else {
+													kill(-left_pid, SIGKILL);
+													reap_job(&pipeline_job);
+												}
+											}
+										}
 									
 									}
 								}
@@ -726,6 +858,9 @@ void *handle_client(void *arg) {
 
 							if (pid == -1) {
 								perror("fork");
+
+								close(stdin_pipe[0]);
+								close(stdin_pipe[1]);
 							} 
 							else if (pid == 0) {
 								//restore normal sigpipe behavior for execute
@@ -818,6 +953,11 @@ void *handle_client(void *arg) {
 									}
 									job_t *job = &jobs[job_count];
 									job->pid = pid;
+									job-> right_pid = 0;
+									job->left_finished = false;
+									job->right_finished = true;
+									job->left_stopped = false;
+									job-> right_stopped = false;
 									job->job_id = next_job_id++;
 									job->stopped = false;
 									job->running = true;
@@ -828,7 +968,12 @@ void *handle_client(void *arg) {
 								}
 
 								else { //Poll client messages while child executes
-									int child_result = wait_for_child_poll(pid, pid, client_fd, left_input_file == NULL ? stdin_pipe[1] : -1);
+								        job_t foreground_job = {0};
+
+								        foreground_job.pid = pid;
+									foreground_job.right_finished = true;
+									
+									int child_result = wait_for_child_poll(&foreground_job, client_fd, left_input_file == NULL ? stdin_pipe[1] : -1);
 
 									if (child_result == -1) {
 										goto client_cleanup;
@@ -838,6 +983,11 @@ void *handle_client(void *arg) {
 										job_t *job = &jobs[job_count];
 
 										job->pid = pid;
+										job->right_pid = 0;
+										job->left_finished = false;
+										job->right_finished = true;
+										job->left_stopped = true;
+										job->right_stopped = false; 
 										job->job_id = next_job_id++;
 										job->stopped = true;
 										job->running = false;
@@ -846,6 +996,13 @@ void *handle_client(void *arg) {
 										snprintf(job->command, sizeof(job->command), "%s", original_command);
 
 										job_count++;
+									}
+									else if (child_result == 1) {
+										//no space to track stopped child
+										kill(-pid, SIGKILL);
+
+										while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {
+										}
 									}
 								}
 							}
@@ -903,19 +1060,11 @@ void *handle_client(void *arg) {
 				kill(-pid, SIGCONT);
 			}
 
-			//terminate entire process group
-			kill(-pid, SIGKILL);
+			//negative pid signals = whole process group
+			kill(-jobs[j].pid, SIGKILL);
 
-			//Reap the direct child to avoid zombie
-			while (waitpid(pid, NULL, 0) == -1) {
-				if (errno == EINTR) {
-					continue;
-				}
-				if (errno != ECHILD) {
-					perror("cleanup waitpid");
-				}
-				break;
-			}
+			//reap both children if job is a pipeline
+			reap_job(&jobs[j]);
 		}
 		close(client_fd);
 		return NULL;
@@ -946,6 +1095,15 @@ int main(void) {
 		perror("fcntl FD_CLOEXEC");
 		close(server_fd);
 		exit(EXIT_FAILURE);
+	}
+
+	//allow for quick TCP server restarts
+	
+	int reuse = 1;
+	if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+		perror("setsockopt SO_REUSEADDR");
+		close(server_fd);
+		return EXIT_FAILURE;
 	}
 	//socket creation phase				
 	struct sockaddr_in server_addr; //holds server's local address, IPv4 specific address
