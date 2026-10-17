@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT 3820
@@ -261,6 +262,25 @@ static void reap_job(job_t *job) {
   }
 }
 
+// logging
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_cmd(const char *who, const char *cmd) {
+  time_t now = time(NULL);
+  struct tm t;
+  localtime_r(&now, &t);
+  char when[32];
+  strftime(when, sizeof(when), "%b %d %H:%M:%S", &t);
+
+  pthread_mutex_lock(&log_lock);
+  FILE *f = fopen("/tmp/yashd.log", "a");
+  if (f != NULL) {
+    fprintf(f, "%s yashd[%s]: %s\n", when, who, cmd);
+    fclose(f);
+  }
+  pthread_mutex_unlock(&log_lock);
+}
+
 void *handle_client(void *arg) {
   // recast the connection struct
   conn_t conn = *(conn_t *)arg;
@@ -346,6 +366,9 @@ void *handle_client(void *arg) {
           // Adding logic to check for CMD based on the phase 2 specification
           if (strncmp(command, "CMD ", 4) == 0) {
             char *actual_command = command + 4;
+
+            // log every cmd before running
+            log_cmd(who, actual_command);
 
             char original_command[256];
             snprintf(original_command, sizeof(original_command), "%s",
