@@ -262,6 +262,27 @@ static void reap_job(job_t *job) {
   }
 }
 
+// new job number
+static int next_job_num(const job_t *jobs, int count) {
+  int highest = 0;
+  for (int j = 0; j < count; j++)
+    if (jobs[j].job_id > highest)
+      highest = jobs[j].job_id;
+  return highest + 1;
+}
+
+// find the newest job for bg and fg cmds
+static int pick_job(const job_t *jobs, int count, bool stopped_only) {
+  int best = -1;
+  for (int j = 0; j < count; j++) {
+    if (stopped_only && !jobs[j].stopped)
+      continue;
+    if (best == -1 || jobs[j].recency > jobs[best].recency)
+      best = j;
+  }
+  return best;
+}
+
 // logging
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -303,7 +324,6 @@ void *handle_client(void *arg) {
   // array
   job_t jobs[MAX_JOBS];
   int job_count = 0;
-  int next_job_id = 1;
   unsigned long recency_counter =
       0; // every time a job becomes relevant to the rank, increment counter and
          // assign value to that job
@@ -373,6 +393,11 @@ void *handle_client(void *arg) {
             char original_command[256];
             snprintf(original_command, sizeof(original_command), "%s",
                      actual_command);
+            // jobs stores "sleep 30" instead of "sleep 30 &"
+            size_t n = strlen(original_command);
+            if (n >= 2 && strcmp(original_command + n - 2, " &") == 0)
+              original_command[n - 2] = '\0';
+
             // Checks whether the command is jobs
             if (strcmp(actual_command, "jobs") == 0) {
               for (int j = job_count - 1; j >= 0; j--) {
@@ -387,28 +412,19 @@ void *handle_client(void *arg) {
               }
 
               unsigned long newest = 0;
-              unsigned long previous = 0;
 
               for (int j = 0; j < job_count; j++) {
-                unsigned long r = jobs[j].recency;
-
-                if (r > newest) {
-                  previous = newest;
-                  newest = r;
-                } else if (r > previous) {
-                  previous = r;
-                }
+                if (jobs[j].recency > newest)
+                  newest = jobs[j].recency;
               }
 
               for (int j = 0; j < job_count; j++) {
                 char line[512];
 
-                snprintf(line, sizeof(line), "[%d]%c %s %s\n", jobs[j].job_id,
-                         (jobs[j].recency == newest)                      ? '+'
-                         : (jobs[j].recency == previous && previous != 0) ? '-'
-                                                                          : ' ',
+                snprintf(line, sizeof(line), "[%d]%c %s %s%s\n", jobs[j].job_id,
+                         (jobs[j].recency == newest) ? '+' : '-',
                          jobs[j].stopped ? "Stopped" : "Running",
-                         jobs[j].command);
+                         jobs[j].command, jobs[j].stopped ? "" : " &");
 
                 if (send_all(client_fd, line, strlen(line)) == -1) {
                   goto client_cleanup;
@@ -422,11 +438,14 @@ void *handle_client(void *arg) {
               continue;
             }
             // Command recognition / fg block
-            if (strncmp(actual_command, "fg ", 3) == 0) {
+            if (strcmp(actual_command, "fg") == 0 ||
+                strncmp(actual_command, "fg ", 3) == 0) {
+              bool bare = strcmp(actual_command, "fg") == 0;
               int requested_id = 0;
 
-              if (sscanf(actual_command, "fg %%%d", &requested_id) != 1 ||
-                  requested_id <= 0) {
+              if (!bare &&
+                  (sscanf(actual_command, "fg %%%d", &requested_id) != 1 ||
+                   requested_id <= 0)) {
                 if (send_all(client_fd, "Invalid job ID\n",
                              strlen("Invalid job ID \n")) == -1) {
                   goto client_cleanup;
@@ -438,7 +457,7 @@ void *handle_client(void *arg) {
                 continue;
               }
 
-              int job_index = -1;
+              int job_index = bare ? pick_job(jobs, job_count, false) : -1;
 
               for (int j = 0; j < job_count; j++) {
                 if (jobs[j].job_id == requested_id) {
@@ -458,6 +477,13 @@ void *handle_client(void *arg) {
                 }
                 command_len = 0;
                 continue;
+              }
+
+              // fg echoes the command
+              char line[512];
+              snprintf(line, sizeof(line), "%s\n", jobs[job_index].command);
+              if (send_all(client_fd, line, strlen(line)) == -1) {
+                goto client_cleanup;
               }
 
               pid_t target_pid = jobs[job_index].pid;
@@ -500,12 +526,15 @@ void *handle_client(void *arg) {
             }
 
             // Bg block
-            if (strncmp(actual_command, "bg ", 3) == 0) {
+            if (strcmp(actual_command, "bg") == 0 ||
+                strncmp(actual_command, "bg ", 3) == 0) {
+              bool bare = strcmp(actual_command, "bg") == 0;
               int requested_id = 0;
 
               // invald id check
-              if (sscanf(actual_command, "bg %%%d", &requested_id) != 1 ||
-                  requested_id <= 0) {
+              if (!bare &&
+                  (sscanf(actual_command, "bg %%%d", &requested_id) != 1 ||
+                   requested_id <= 0)) {
                 if (send_all(client_fd, "Invalid job ID \n",
                              strlen("Invalid job ID\n")) == -1) {
                   goto client_cleanup;
@@ -519,7 +548,7 @@ void *handle_client(void *arg) {
               }
 
               // search for jobs associated with bg
-              int job_index = -1;
+              int job_index = bare ? pick_job(jobs, job_count, true) : -1;
 
               for (int j = 0; j < job_count; j++) {
                 if (jobs[j].job_id == requested_id) {
@@ -557,6 +586,14 @@ void *handle_client(void *arg) {
                 jobs[job_index].stopped = false;
                 jobs[job_index].running = true;
                 jobs[job_index].recency = ++recency_counter;
+
+                // bg prints jobs with &
+                char line[512];
+                snprintf(line, sizeof(line), "[%d]+ %s &\n",
+                         jobs[job_index].job_id, jobs[job_index].command);
+                if (send_all(client_fd, line, strlen(line)) == -1) {
+                  goto client_cleanup;
+                }
               }
               if (send_prompt(client_fd) == -1) {
                 goto client_cleanup;
@@ -741,7 +778,7 @@ void *handle_client(void *arg) {
 
                   if (left_output_file != NULL) {
                     int fd = open(left_output_file,
-                                  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                  O_WRONLY | O_CREAT | O_TRUNC, 0664);
                     if (fd < 0) {
                       perror("open");
                       _exit(1);
@@ -754,7 +791,6 @@ void *handle_client(void *arg) {
                   }
 
                   execvp(left_args[0], left_args);
-                  perror("execvp");
                   _exit(127);
                 } else {
                   // Parent establishes the left child process group
@@ -816,7 +852,7 @@ void *handle_client(void *arg) {
                     }
                     if (right_output_file != NULL) {
                       int fd = open(right_output_file,
-                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                    O_WRONLY | O_CREAT | O_TRUNC, 0664);
 
                       if (fd < 0) {
                         perror("open");
@@ -831,7 +867,6 @@ void *handle_client(void *arg) {
                       close(fd);
                     }
                     execvp(right_argv[0], right_argv);
-                    perror("execvp");
                     _exit(127);
                   } else {
                     if (right_pid > 0) {
@@ -857,7 +892,7 @@ void *handle_client(void *arg) {
                              "%s", original_command);
 
                     if (background) {
-                      pipeline_job.job_id = next_job_id++;
+                      pipeline_job.job_id = next_job_num(jobs, job_count);
                       jobs[job_count++] = pipeline_job;
                     } else {
                       int result =
@@ -871,7 +906,7 @@ void *handle_client(void *arg) {
 
                       if (result == 1) {
                         if (job_count < MAX_JOBS) {
-                          pipeline_job.job_id = next_job_id++;
+                          pipeline_job.job_id = next_job_num(jobs, job_count);
                           pipeline_job.stopped = true;
                           pipeline_job.running = false;
                           jobs[job_count++] = pipeline_job;
@@ -945,7 +980,7 @@ void *handle_client(void *arg) {
                 // Output redirection from phase 1
                 if (left_output_file != NULL) {
                   int fd_out = open(left_output_file,
-                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                    O_WRONLY | O_CREAT | O_TRUNC, 0664);
                   if (fd_out < 0) {
                     perror("open");
                     _exit(1);
@@ -971,7 +1006,6 @@ void *handle_client(void *arg) {
                 }
 
                 if (execvp(left_args[0], left_args) == -1) {
-                  perror("execvp");
                   _exit(127);
                 }
               } else {
@@ -1002,7 +1036,7 @@ void *handle_client(void *arg) {
                   job->right_finished = true;
                   job->left_stopped = false;
                   job->right_stopped = false;
-                  job->job_id = next_job_id++;
+                  job->job_id = next_job_num(jobs, job_count);
                   job->stopped = false;
                   job->running = true;
                   job->recency = ++recency_counter;
@@ -1036,7 +1070,7 @@ void *handle_client(void *arg) {
                     job->right_finished = true;
                     job->left_stopped = true;
                     job->right_stopped = false;
-                    job->job_id = next_job_id++;
+                    job->job_id = next_job_num(jobs, job_count);
                     job->stopped = true;
                     job->running = false;
                     job->recency = ++recency_counter;
