@@ -1,3 +1,5 @@
+#define _GNU_SOURCE // pipe2
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -29,6 +31,7 @@ typedef struct {
   bool stopped;
   bool running;
   unsigned long recency; // timestamp like var to keep of job
+  int stdin_fd; // write end of the child's stdin pipe, -1 = none
   char command[256];
 } job_t;
 
@@ -65,7 +68,7 @@ static int send_msg(int fd, const char *msg) {
 static bool job_done(const job_t *job);
 static void reap_job(job_t *job);
 
-static int wait_for_child_poll(job_t *job, int client_fd, int stdin_fd) {
+static int wait_for_child_poll(job_t *job, int client_fd, int *stdin_fd) {
   int status;
   int stopped = 0;
   int wait_error = 0;
@@ -158,24 +161,24 @@ static int wait_for_child_poll(job_t *job, int client_fd, int stdin_fd) {
 
             else if (len == 5 &&
                      memcmp(control_buffer + start, "CTL d", 5) == 0) {
-              if (stdin_fd >= 0) {
-                close(stdin_fd);
-                stdin_fd = -1;
+              if (*stdin_fd >= 0) {
+                close(*stdin_fd);
+                *stdin_fd = -1;
               }
             }
 
             else {
               // Forward regular input to the child's stdin
-              if (stdin_fd >= 0 && len > 0) {
-                ssize_t written = write(stdin_fd, control_buffer + start, len);
+              if (*stdin_fd >= 0 && len > 0) {
+                ssize_t written = write(*stdin_fd, control_buffer + start, len);
 
                 if (written == -1) {
                   perror("stdin write");
                 }
               }
 
-              if (stdin_fd >= 0) {
-                write(stdin_fd, "\n", 1);
+              if (*stdin_fd >= 0) {
+                write(*stdin_fd, "\n", 1);
               }
             }
 
@@ -205,8 +208,10 @@ static int wait_for_child_poll(job_t *job, int client_fd, int stdin_fd) {
     }
   }
 
-  if (stdin_fd >= 0) {
-    close(stdin_fd);
+  // stopped: keep the pipe open so fg can feed it again
+  if (!stopped && *stdin_fd >= 0) {
+    close(*stdin_fd);
+    *stdin_fd = -1;
   }
   return wait_error ? -1 : stopped;
 }
@@ -303,6 +308,8 @@ static int report_done(int fd, job_t *jobs, int *count) {
              jobs[j].recency == newest ? '+' : '-', jobs[j].command);
     if (send_msg(fd, line) == -1)
       return -1;
+    if (jobs[j].stdin_fd >= 0)
+      close(jobs[j].stdin_fd);
     for (int k = j; k < *count - 1; k++)
       jobs[k] = jobs[k + 1];
     (*count)--;
@@ -512,8 +519,8 @@ void *handle_client(void *arg) {
                 jobs[job_index].left_stopped = false;
                 jobs[job_index].right_stopped = false;
 
-                int fg_result =
-                    wait_for_child_poll(&jobs[job_index], client_fd, -1);
+                int fg_result = wait_for_child_poll(
+                    &jobs[job_index], client_fd, &jobs[job_index].stdin_fd);
 
                 if (fg_result == -1) {
                   goto client_cleanup;
@@ -596,6 +603,12 @@ void *handle_client(void *arg) {
                 jobs[job_index].stopped = false;
                 jobs[job_index].running = true;
                 jobs[job_index].recency = ++recency_counter;
+
+                // bg jobs get no stdin, same as & jobs
+                if (jobs[job_index].stdin_fd >= 0) {
+                  close(jobs[job_index].stdin_fd);
+                  jobs[job_index].stdin_fd = -1;
+                }
 
                 // bg prints jobs with &
                 char line[512];
@@ -733,7 +746,8 @@ void *handle_client(void *arg) {
                 pipe_index != -1) {
               int pipefd[2];
 
-              if (pipe(pipefd) == -1) {
+              // O_CLOEXEC
+              if (pipe2(pipefd, O_CLOEXEC) == -1) {
                 perror("pipe");
               } else {
                 pid_t left_pid = fork();
@@ -886,6 +900,7 @@ void *handle_client(void *arg) {
                     // Block waits on the updating wait_for_child_poll() to
                     // acept job and track full proess group
                     job_t pipeline_job = {0};
+                    pipeline_job.stdin_fd = -1;
 
                     pipeline_job.pid = left_pid;
                     pipeline_job.right_pid = right_pid;
@@ -900,7 +915,8 @@ void *handle_client(void *arg) {
                       jobs[job_count++] = pipeline_job;
                     } else {
                       int result =
-                          wait_for_child_poll(&pipeline_job, client_fd, -1);
+                          wait_for_child_poll(&pipeline_job, client_fd,
+                                              &pipeline_job.stdin_fd);
 
                       if (result == -1) {
                         kill(-left_pid, SIGKILL);
@@ -932,7 +948,7 @@ void *handle_client(void *arg) {
               // Create pipe for interactive stdin
               int stdin_pipe[2];
 
-              if (pipe(stdin_pipe) == -1) {
+              if (pipe2(stdin_pipe, O_CLOEXEC) == -1) {
                 perror("stdin pipe");
                 goto client_cleanup;
               }
@@ -1044,6 +1060,7 @@ void *handle_client(void *arg) {
                   job->stopped = false;
                   job->running = true;
                   job->recency = ++recency_counter;
+                  job->stdin_fd = -1;
 
                   snprintf(job->command, sizeof(job->command), "%s",
                            original_command);
@@ -1056,9 +1073,9 @@ void *handle_client(void *arg) {
                   foreground_job.pid = pid;
                   foreground_job.right_finished = true;
 
-                  int child_result = wait_for_child_poll(
-                      &foreground_job, client_fd,
-                      left_input_file == NULL ? stdin_pipe[1] : -1);
+                  int in_fd = left_input_file == NULL ? stdin_pipe[1] : -1;
+                  int child_result =
+                      wait_for_child_poll(&foreground_job, client_fd, &in_fd);
 
                   if (child_result == -1) {
                     goto client_cleanup;
@@ -1078,6 +1095,7 @@ void *handle_client(void *arg) {
                     job->stopped = true;
                     job->running = false;
                     job->recency = ++recency_counter;
+                    job->stdin_fd = in_fd; // fg feeds cat through it again
 
                     snprintf(job->command, sizeof(job->command), "%s",
                              original_command);
@@ -1085,6 +1103,9 @@ void *handle_client(void *arg) {
                     job_count++;
                   } else if (child_result == 1) {
                     // no space to track stopped child
+                    if (in_fd >= 0) {
+                      close(in_fd);
+                    }
                     kill(-pid, SIGKILL);
 
                     while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {
@@ -1138,6 +1159,10 @@ client_cleanup:
 
     // negative pid signals = whole process group
     kill(-jobs[j].pid, SIGKILL);
+
+    if (jobs[j].stdin_fd >= 0) {
+      close(jobs[j].stdin_fd);
+    }
 
     // reap both children if job is a pipeline
     reap_job(&jobs[j]);
