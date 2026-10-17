@@ -1,6 +1,7 @@
 #define _GNU_SOURCE // pipe2
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -393,7 +394,9 @@ void *handle_client(void *arg) {
       continue;
     }
 
-    bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    // one byte at a time: anything after the CMD line (pasted stdin) stays
+    // in the socket for wait_for_child_poll to hand to the command
+    bytes_received = recv(client_fd, buffer, 1, 0);
 
     if (bytes_received > 0) {
       for (size_t i = 0; i < (size_t)bytes_received; i++) {
@@ -1171,6 +1174,31 @@ client_cleanup:
   return NULL;
 }
 
+static int term_pipe[2];
+
+// SIGTERM handler: only wake the watcher thread (write is signal-safe)
+static void on_term(int sig) {
+  (void)sig;
+  write(term_pipe[1], "x", 1);
+}
+
+// kill every process in our session (every client's jobs), then exit
+static void *term_watch(void *arg) {
+  (void)arg;
+  char c;
+  while (read(term_pipe[0], &c, 1) == -1 && errno == EINTR) {
+  }
+  pid_t me = getpid();
+  DIR *proc = opendir("/proc");
+  struct dirent *e;
+  while (proc != NULL && (e = readdir(proc)) != NULL) {
+    pid_t pid = (pid_t)atoi(e->d_name);
+    if (pid > 0 && pid != me && getsid(pid) == me)
+      kill(pid, SIGKILL);
+  }
+  exit(EXIT_SUCCESS);
+}
+
 static void daemon_init(const char *dir) {
   pid_t pid = fork();
   if (pid < 0)
@@ -1220,6 +1248,23 @@ int main(void) {
     perror("sigaction SIGPIPE");
     return EXIT_FAILURE;
   }
+
+  // kill yashd (SIGTERM): take every client's jobs down with it
+  if (pipe2(term_pipe, O_CLOEXEC) == -1) {
+    perror("term pipe");
+    return EXIT_FAILURE;
+  }
+  struct sigaction term_sa = {0};
+  term_sa.sa_handler = on_term;
+  term_sa.sa_flags = SA_RESTART;
+  sigemptyset(&term_sa.sa_mask);
+  if (sigaction(SIGTERM, &term_sa, NULL) == -1) {
+    perror("sigaction SIGTERM");
+    return EXIT_FAILURE;
+  }
+  pthread_t watcher;
+  pthread_create(&watcher, NULL, term_watch, NULL);
+  pthread_detach(watcher);
 
   int server_fd = socket(AF_INET, SOCK_STREAM,
                          0); // server_fd contains socket file descriptor &

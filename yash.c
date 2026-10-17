@@ -85,6 +85,7 @@ int main(int argc, char *argv[]) {
   // main loop
   char line[256], cmd[300], buf[1024];
   bool busy = false;
+  bool stdin_closed = false;
   char prev = 0, last = 0;
 
   while (1) {
@@ -107,12 +108,16 @@ int main(int argc, char *argv[]) {
         prev = last;
         last = buf[i];
       }
-      if (prev == '\n' && last == '#')
+      if (prev == '\n' && last == '#') {
         busy = false;
+        // stdin already closed: nothing left to send, so quit
+        if (stdin_closed)
+          break;
+      }
     }
 
     // keyboard loop
-    if (fds[0].revents & POLLIN) {
+    if (fds[0].revents & (POLLIN | POLLHUP)) {
       // get stdin and check for Ctrl-D (NULL)
       if (fgets(line, sizeof line, stdin) == NULL) {
         if (!busy)
@@ -122,6 +127,12 @@ int main(int argc, char *argv[]) {
         if (send_all(server_fd, "CTL d\n", 6) == -1) {
           perror("send");
           exit(EXIT_FAILURE);
+        }
+        // pipe or hung-up terminal: no more input is coming, so stop
+        // watching stdin and quit once this command's prompt arrives
+        if (fds[0].revents & POLLHUP) {
+          fds[0].fd = -1;
+          stdin_closed = true;
         }
         continue;
       }
