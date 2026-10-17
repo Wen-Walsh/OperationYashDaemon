@@ -58,6 +58,10 @@ static int send_all(int fd, const char *data, size_t length) {
 
 static int send_prompt(int fd) { return send_all(fd, "\n#", 2); }
 
+static int send_msg(int fd, const char *msg) {
+  return send_all(fd, msg, strlen(msg));
+}
+
 static bool job_done(const job_t *job);
 static void reap_job(job_t *job);
 
@@ -283,6 +287,30 @@ static int pick_job(const job_t *jobs, int count, bool stopped_only) {
   return best;
 }
 
+// print [n]- Done cmd for each finished job
+// then drop it
+static int report_done(int fd, job_t *jobs, int *count) {
+  unsigned long newest = 0;
+  for (int j = 0; j < *count; j++)
+    if (jobs[j].recency > newest)
+      newest = jobs[j].recency;
+  for (int j = 0; j < *count; j++) {
+    refresh_job(&jobs[j]);
+    if (!job_done(&jobs[j]))
+      continue;
+    char line[512];
+    snprintf(line, sizeof(line), "[%d]%c Done %s\n", jobs[j].job_id,
+             jobs[j].recency == newest ? '+' : '-', jobs[j].command);
+    if (send_msg(fd, line) == -1)
+      return -1;
+    for (int k = j; k < *count - 1; k++)
+      jobs[k] = jobs[k + 1];
+    (*count)--;
+    j--;
+  }
+  return 0;
+}
+
 // logging
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -336,17 +364,11 @@ void *handle_client(void *arg) {
 
     // This block only runs when the handler reaches the main receive loop.
     // Thread blocked inside fg won't perform cleanup until it returns
-    for (int j = job_count - 1; j >= 0; j--) {
+    // report_done prints and removes on the next cmd
+    for (int j = 0; j < job_count; j++) {
       refresh_job(&jobs[j]);
-
-      if (job_done(&jobs[j])) {
-        for (int k = j; k < job_count - 1; k++) {
-          jobs[k] = jobs[k + 1];
-        }
-
-        job_count--;
-      }
     }
+
     // Making serer check periodically on background children even if client
     // isn't receiving commands
     struct pollfd client_poll = {.fd = client_fd, .events = POLLIN};
@@ -390,6 +412,11 @@ void *handle_client(void *arg) {
             // log every cmd before running
             log_cmd(who, actual_command);
 
+            // done notice for finished job
+            if (report_done(client_fd, jobs, &job_count) == -1) {
+              goto client_cleanup;
+            }
+
             char original_command[256];
             snprintf(original_command, sizeof(original_command), "%s",
                      actual_command);
@@ -400,17 +427,6 @@ void *handle_client(void *arg) {
 
             // Checks whether the command is jobs
             if (strcmp(actual_command, "jobs") == 0) {
-              for (int j = job_count - 1; j >= 0; j--) {
-                refresh_job(&jobs[j]);
-
-                if (job_done(&jobs[j])) {
-                  for (int k = j; k < job_count - 1; k++) {
-                    jobs[k] = jobs[k + 1];
-                  }
-                  job_count--;
-                }
-              }
-
               unsigned long newest = 0;
 
               for (int j = 0; j < job_count; j++) {
@@ -446,8 +462,7 @@ void *handle_client(void *arg) {
               if (!bare &&
                   (sscanf(actual_command, "fg %%%d", &requested_id) != 1 ||
                    requested_id <= 0)) {
-                if (send_all(client_fd, "Invalid job ID\n",
-                             strlen("Invalid job ID \n")) == -1) {
+                if (send_msg(client_fd, "Invalid job ID\n") == -1) {
                   goto client_cleanup;
                 }
                 if (send_prompt(client_fd) == -1) {
@@ -467,8 +482,7 @@ void *handle_client(void *arg) {
               }
 
               if (job_index == -1) {
-                if (send_all(client_fd, "Job not found\n",
-                             strlen("Job not found\n")) == -1) {
+                if (send_msg(client_fd, "Job not found\n") == -1) {
                   goto client_cleanup;
                 }
 
@@ -491,8 +505,7 @@ void *handle_client(void *arg) {
               if (kill(-target_pid, SIGCONT) == -1) {
                 perror("fg SIGCONT");
 
-                if (send_all(client_fd, "Cannot resume job\n",
-                             strlen("Cannot resume job\n")) == -1) {
+                if (send_msg(client_fd, "Cannot resume job\n") == -1) {
                   goto client_cleanup;
                 }
               } else {
@@ -535,8 +548,7 @@ void *handle_client(void *arg) {
               if (!bare &&
                   (sscanf(actual_command, "bg %%%d", &requested_id) != 1 ||
                    requested_id <= 0)) {
-                if (send_all(client_fd, "Invalid job ID \n",
-                             strlen("Invalid job ID\n")) == -1) {
+                if (send_msg(client_fd, "Invalid job ID\n") == -1) {
                   goto client_cleanup;
                 }
                 if (send_prompt(client_fd) == -1) {
@@ -558,8 +570,7 @@ void *handle_client(void *arg) {
               }
 
               if (job_index == -1) {
-                if (send_all(client_fd, "Job not found \n",
-                             strlen("Job not found\n")) == -1) {
+                if (send_msg(client_fd, "Job not found\n") == -1) {
                   goto client_cleanup;
                 }
                 if (send_prompt(client_fd) == -1) {
@@ -575,8 +586,7 @@ void *handle_client(void *arg) {
               if (kill(-target_pid, SIGCONT) == -1) {
                 perror("bg SIGCONT");
 
-                if (send_all(client_fd, "Cannot resume job \n",
-                             strlen("Cannot resume job \n")) == -1) {
+                if (send_msg(client_fd, "Cannot resume job\n") == -1) {
                   goto client_cleanup;
                 }
               } else {
@@ -627,10 +637,6 @@ void *handle_client(void *arg) {
             }
             // Edge case against empty commands so it doesn't crash the server
             if (argc == 0) {
-              if (send_all(client_fd, "Empty command \n",
-                           strlen("Empty command \n")) == -1) {
-                goto client_cleanup;
-              }
               if (send_prompt(client_fd) == -1) {
                 goto client_cleanup;
               }
@@ -640,8 +646,7 @@ void *handle_client(void *arg) {
             }
             // stop from writing beyond max jobs
             if (background && job_count >= MAX_JOBS) {
-              if (send_all(client_fd, "Job limit reached \n",
-                           strlen("Job limit reached\n")) == -1) {
+              if (send_msg(client_fd, "Job limit reached\n") == -1) {
                 goto client_cleanup;
               }
               if (send_prompt(client_fd) == -1) {
@@ -715,12 +720,11 @@ void *handle_client(void *arg) {
             if (pipe_index != -1 && (left_count == 0 || right_count == 0)) {
               invalid_pipe = true;
             }
-            if (invalid_pipe && send_all(client_fd, "Invalid pipe syntax \n",
-                                         strlen("Invalid pipe syntax\n")) == -1)
+            if (invalid_pipe &&
+                send_msg(client_fd, "Invalid pipe syntax\n") == -1)
               goto client_cleanup;
             if (invalid_redirection &&
-                send_all(client_fd, "Invalid redirection syntax\n",
-                         strlen("Invalid redirection syntax\n")) == -1)
+                send_msg(client_fd, "Invalid redirection syntax\n") == -1)
               goto client_cleanup;
 
             // Only nonempty commands should enter this logic
@@ -1009,8 +1013,8 @@ void *handle_client(void *arg) {
                   _exit(127);
                 }
               } else {
-                close(stdin_pipe[0]); // Parent does not read from child's stdin
-                                      // pipe
+                close(stdin_pipe[0]); // Parent does not read from child's
+                                      // stdin pipe
                 // Calls pgid
                 if (setpgid(pid, pid) == -1) {
                   if (errno != EACCES) {
@@ -1089,13 +1093,6 @@ void *handle_client(void *arg) {
                 }
               }
             }
-          } else if (command[0] != '\0') {
-            // Need to implement CTL and interactive stdin are part of the later
-            // control phase
-            if (send_all(client_fd, "Unsupported message \n",
-                         strlen("Unsupported message \n")) == -1) {
-              goto client_cleanup;
-            }
           }
 
           if (send_prompt(client_fd) == -1) {
@@ -1117,7 +1114,6 @@ void *handle_client(void *arg) {
           command_len++;
         }
       }
-
     } else if (bytes_received == 0) {
       printf("Client disconneted \n");
       break;
