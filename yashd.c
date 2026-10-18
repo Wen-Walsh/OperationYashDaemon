@@ -21,6 +21,9 @@
 #define PORT 3820
 #define MAX_JOBS 20
 
+// umask yashd was started with; commands get it back before exec
+static mode_t start_umask = 022;
+
 typedef struct {
   pid_t pid;
   pid_t right_pid;
@@ -272,6 +275,14 @@ static void reap_job(job_t *job) {
   }
 }
 
+// close both ends of a pipe that may not have been opened (-1)
+static void close_pipe(int p[2]) {
+  if (p[0] >= 0)
+    close(p[0]);
+  if (p[1] >= 0)
+    close(p[1]);
+}
+
 // new job number
 static int next_job_num(const job_t *jobs, int count) {
   int highest = 0;
@@ -330,7 +341,7 @@ static void log_cmd(const char *who, const char *cmd) {
   strftime(when, sizeof(when), "%b %d %H:%M:%S", &t);
 
   pthread_mutex_lock(&log_lock);
-  FILE *f = fopen("/tmp/yashd.log", "a");
+  FILE *f = fopen("/tmp/yashd.log", "ae"); // e: O_CLOEXEC
   if (f != NULL) {
     fprintf(f, "%s yashd[%s]: %s\n", when, who, cmd);
     fclose(f);
@@ -419,8 +430,9 @@ void *handle_client(void *arg) {
           if (strncmp(command, "CMD ", 4) == 0) {
             char *actual_command = command + 4;
 
-            // log every cmd before running
-            log_cmd(who, actual_command);
+            // log every cmd before running (not a blank Enter)
+            if (actual_command[strspn(actual_command, " ")] != '\0')
+              log_cmd(who, actual_command);
 
             // done notice for finished job
             if (report_done(client_fd, jobs, &job_count) == -1) {
@@ -747,11 +759,20 @@ void *handle_client(void *arg) {
             // Commands with pipes
             if (left_count > 0 && !invalid_redirection && !invalid_pipe &&
                 pipe_index != -1) {
+              // typed input goes to the left command, same as a single one
+              int stdin_pipe[2] = {-1, -1};
+              if (left_input_file == NULL &&
+                  pipe2(stdin_pipe, O_CLOEXEC) == -1) {
+                perror("stdin pipe");
+                goto client_cleanup;
+              }
+
               int pipefd[2];
 
               // O_CLOEXEC
               if (pipe2(pipefd, O_CLOEXEC) == -1) {
                 perror("pipe");
+                close_pipe(stdin_pipe);
               } else {
                 pid_t left_pid = fork();
 
@@ -759,6 +780,7 @@ void *handle_client(void *arg) {
                   perror("fork");
                   close(pipefd[0]);
                   close(pipefd[1]);
+                  close_pipe(stdin_pipe);
                 } else if (left_pid == 0) {
                   struct sigaction child_sa = {0};
                   child_sa.sa_handler = SIG_DFL;
@@ -775,6 +797,11 @@ void *handle_client(void *arg) {
                   }
                   if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
                     perror("dup2");
+                    _exit(1);
+                  }
+                  // typed input (a < file below replaces it)
+                  if (stdin_pipe[0] >= 0 &&
+                      dup2(stdin_pipe[0], STDIN_FILENO) == -1) {
                     _exit(1);
                   }
                   if (dup2(client_fd, STDERR_FILENO) == -1) {
@@ -811,6 +838,8 @@ void *handle_client(void *arg) {
                     close(fd);
                   }
 
+                  umask(start_umask); // after the > open, so it stays 0664
+                  signal(SIGHUP, SIG_DFL); // undo the daemon's SIG_IGN
                   execvp(left_args[0], left_args);
                   _exit(127);
                 } else {
@@ -825,6 +854,7 @@ void *handle_client(void *arg) {
                     perror("fork");
                     close(pipefd[0]);
                     close(pipefd[1]);
+                    close_pipe(stdin_pipe);
 
                     kill(-left_pid, SIGKILL);
 
@@ -887,6 +917,8 @@ void *handle_client(void *arg) {
 
                       close(fd);
                     }
+                    umask(start_umask); // after the > open, so it stays 0664
+                    signal(SIGHUP, SIG_DFL); // undo the daemon's SIG_IGN
                     execvp(right_argv[0], right_argv);
                     _exit(127);
                   } else {
@@ -899,11 +931,14 @@ void *handle_client(void *arg) {
                     // Parent should close both ends
                     close(pipefd[0]);
                     close(pipefd[1]);
+                    // parent keeps only the write end of the left's stdin
+                    if (stdin_pipe[0] >= 0)
+                      close(stdin_pipe[0]);
 
                     // Block waits on the updating wait_for_child_poll() to
                     // acept job and track full proess group
                     job_t pipeline_job = {0};
-                    pipeline_job.stdin_fd = -1;
+                    pipeline_job.stdin_fd = stdin_pipe[1];
 
                     pipeline_job.pid = left_pid;
                     pipeline_job.right_pid = right_pid;
@@ -914,6 +949,11 @@ void *handle_client(void *arg) {
                              "%s", original_command);
 
                     if (background) {
+                      // background jobs get no typed input
+                      if (pipeline_job.stdin_fd >= 0) {
+                        close(pipeline_job.stdin_fd);
+                        pipeline_job.stdin_fd = -1;
+                      }
                       pipeline_job.job_id = next_job_num(jobs, job_count);
                       jobs[job_count++] = pipeline_job;
                     } else {
@@ -934,6 +974,8 @@ void *handle_client(void *arg) {
                           pipeline_job.running = false;
                           jobs[job_count++] = pipeline_job;
                         } else {
+                          if (pipeline_job.stdin_fd >= 0)
+                            close(pipeline_job.stdin_fd);
                           kill(-left_pid, SIGKILL);
                           reap_job(&pipeline_job);
                         }
@@ -1028,6 +1070,8 @@ void *handle_client(void *arg) {
                   close(fd_in);
                 }
 
+                umask(start_umask); // after the > open, so it stays 0664
+                signal(SIGHUP, SIG_DFL); // undo the daemon's SIG_IGN
                 if (execvp(left_args[0], left_args) == -1) {
                   _exit(127);
                 }
@@ -1175,10 +1219,17 @@ client_cleanup:
 }
 
 static int term_pipe[2];
+static pid_t daemon_pid;
 
 // SIGTERM handler: only wake the watcher thread (write is signal-safe)
 static void on_term(int sig) {
-  (void)sig;
+  // a command between fork and exec still has this handler: let it die
+  // the normal way instead of shutting the whole daemon down
+  if (getpid() != daemon_pid) {
+    signal(sig, SIG_DFL);
+    raise(sig);
+    return;
+  }
   write(term_pipe[1], "x", 1);
 }
 
@@ -1188,6 +1239,8 @@ static void *term_watch(void *arg) {
   char c;
   while (read(term_pipe[0], &c, 1) == -1 && errno == EINTR) {
   }
+  // the pid in it is about to be dead, so don't leave it for kill $(cat ..)
+  unlink("/tmp/yashd.pid");
   pid_t me = getpid();
   DIR *proc = opendir("/proc");
   struct dirent *e;
@@ -1211,8 +1264,8 @@ static void daemon_init(const char *dir) {
   signal(SIGHUP, SIG_IGN);
   // change dir to /tmp
   chdir(dir);
-  // open() mode is used as-is
-  umask(0);
+  // open() mode is used as-is (save the old one for the commands)
+  start_umask = umask(0);
   // drop every inherited fd
   for (int fd = getdtablesize() - 1; fd >= 0; fd--)
     close(fd);
@@ -1228,11 +1281,15 @@ int main(void) {
   // daemon creation
   daemon_init("/tmp");
   // get a file to put the pid in
-  int pf = open("/tmp/yashd.pid", O_RDWR | O_CREAT, 0644);
+  int pf = open("/tmp/yashd.pid", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
   // if another yashd already has the file then exit
   // so there isn't multiple yashd
-  if (pf < 0 || lockf(pf, F_TLOCK, 0) != 0)
+  if (pf < 0 || lockf(pf, F_TLOCK, 0) != 0) {
+    // stderr is /dev/null by now, so leave the reason in the log
+    log_cmd("startup", pf < 0 ? "cannot open /tmp/yashd.pid"
+                              : "another yashd is already running");
     exit(EXIT_FAILURE);
+  }
   // write pid to file
   char buf[16];
   int n = snprintf(buf, sizeof buf, "%d\n", getpid());
@@ -1249,7 +1306,8 @@ int main(void) {
     return EXIT_FAILURE;
   }
 
-  // kill yashd (SIGTERM): take every client's jobs down with it
+  // kill yashd (SIGTERM, SIGINT, SIGQUIT): take every client's jobs with it
+  daemon_pid = getpid();
   if (pipe2(term_pipe, O_CLOEXEC) == -1) {
     perror("term pipe");
     return EXIT_FAILURE;
@@ -1258,8 +1316,10 @@ int main(void) {
   term_sa.sa_handler = on_term;
   term_sa.sa_flags = SA_RESTART;
   sigemptyset(&term_sa.sa_mask);
-  if (sigaction(SIGTERM, &term_sa, NULL) == -1) {
-    perror("sigaction SIGTERM");
+  if (sigaction(SIGTERM, &term_sa, NULL) == -1 ||
+      sigaction(SIGINT, &term_sa, NULL) == -1 ||
+      sigaction(SIGQUIT, &term_sa, NULL) == -1) {
+    perror("sigaction TERM/INT/QUIT");
     return EXIT_FAILURE;
   }
   pthread_t watcher;
@@ -1303,6 +1363,11 @@ int main(void) {
   // binding: assigning local IP address and port
   if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) ==
       -1) {
+    // stderr is /dev/null by now, so leave the reason in the log
+    char why[128];
+    snprintf(why, sizeof(why), "bind port %d: %s", PORT, strerror(errno));
+    log_cmd("startup", why);
+    unlink("/tmp/yashd.pid");
     perror("bind");
     close(server_fd);
     exit(EXIT_FAILURE);
@@ -1320,7 +1385,9 @@ int main(void) {
     if (conn == NULL)
       continue; // out of memory
     socklen_t len = sizeof(conn->addr);
-    conn->fd = accept(server_fd, (struct sockaddr *)&conn->addr, &len);
+    // SOCK_CLOEXEC: other clients' commands don't inherit this socket
+    conn->fd = accept4(server_fd, (struct sockaddr *)&conn->addr, &len,
+                       SOCK_CLOEXEC);
 
     if (conn->fd == -1) {
       free(conn);

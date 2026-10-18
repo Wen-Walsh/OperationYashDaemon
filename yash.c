@@ -78,7 +78,8 @@ int main(int argc, char *argv[]) {
   signal(SIGTSTP, on_sigtstp);
 
   struct pollfd fds[2] = {
-      {.fd = STDIN_FILENO, .events = POLLIN},
+      // stdin: watched once the server's first prompt arrives
+      {.fd = -1, .events = POLLIN},
       {.fd = server_fd, .events = POLLIN},
   };
 
@@ -113,6 +114,8 @@ int main(int argc, char *argv[]) {
         // stdin already closed: nothing left to send, so quit
         if (stdin_closed)
           break;
+        // a prompt has arrived, so the keyboard can be read now
+        fds[0].fd = STDIN_FILENO;
       }
     }
 
