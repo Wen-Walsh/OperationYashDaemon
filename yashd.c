@@ -1124,6 +1124,8 @@ void *handle_client(void *arg) {
                       wait_for_child_poll(&foreground_job, client_fd, &in_fd);
 
                   if (child_result == -1) {
+                    kill(-pid, SIGKILL);
+                    reap_job(&foreground_job);
                     goto client_cleanup;
                   }
 
@@ -1238,8 +1240,6 @@ static void *term_watch(void *arg) {
   char c;
   while (read(term_pipe[0], &c, 1) == -1 && errno == EINTR) {
   }
-  // the pid in it is about to be dead, so don't leave it for kill $(cat ..)
-  unlink("/tmp/yashd.pid");
   pid_t me = getpid();
   DIR *proc = opendir("/proc");
   struct dirent *e;
@@ -1250,6 +1250,9 @@ static void *term_watch(void *arg) {
   }
   exit(EXIT_SUCCESS);
 }
+
+// the pid in it is about to be dead, so don't leave it for kill $(cat ..)
+static void remove_pidfile(void) { unlink("/tmp/yashd.pid"); }
 
 static void daemon_init(const char *dir) {
   pid_t pid = fork();
@@ -1294,6 +1297,8 @@ int main(void) {
   int n = snprintf(buf, sizeof buf, "%d\n", getpid());
   ftruncate(pf, 0);
   write(pf, buf, n);
+  // every exit from here on removes it (after the lock, so never another yashd's)
+  atexit(remove_pidfile);
 
   // Prevent broken pipe from terminating everything
   struct sigaction sa = {0};
@@ -1366,7 +1371,6 @@ int main(void) {
     char why[128];
     snprintf(why, sizeof(why), "bind port %d: %s", PORT, strerror(errno));
     log_cmd("startup", why);
-    unlink("/tmp/yashd.pid");
     perror("bind");
     close(server_fd);
     exit(EXIT_FAILURE);
@@ -1394,13 +1398,13 @@ int main(void) {
     }
 
     pthread_t thread_id;
-    if (pthread_create(&thread_id, NULL, handle_client, conn) != 0) {
-      perror("pthread_create error");
-      close(server_fd);
+    int rc = pthread_create(&thread_id, NULL, handle_client, conn);
+    if (rc != 0) {
+      log_cmd("server", strerror(rc));
+      close(conn->fd);
       free(conn);
-      exit(EXIT_FAILURE);
+      continue;
     }
-
     pthread_detach(thread_id);
   }
 
