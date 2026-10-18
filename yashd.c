@@ -35,7 +35,7 @@ typedef struct {
   bool stopped;
   bool running;
   unsigned long recency; // timestamp like var to keep of job
-  int stdin_fd; // write end of the child's stdin pipe, -1 = none
+  int stdin_fd;          // write end of the child's stdin pipe, -1 = none
   char command[256];
 } job_t;
 
@@ -534,8 +534,8 @@ void *handle_client(void *arg) {
                 jobs[job_index].left_stopped = false;
                 jobs[job_index].right_stopped = false;
 
-                int fg_result = wait_for_child_poll(
-                    &jobs[job_index], client_fd, &jobs[job_index].stdin_fd);
+                int fg_result = wait_for_child_poll(&jobs[job_index], client_fd,
+                                                    &jobs[job_index].stdin_fd);
 
                 if (fg_result == -1) {
                   goto client_cleanup;
@@ -838,7 +838,7 @@ void *handle_client(void *arg) {
                     close(fd);
                   }
 
-                  umask(start_umask); // after the > open, so it stays 0664
+                  umask(start_umask);      // after the > open, so it stays 0664
                   signal(SIGHUP, SIG_DFL); // undo the daemon's SIG_IGN
                   execvp(left_args[0], left_args);
                   _exit(127);
@@ -957,9 +957,8 @@ void *handle_client(void *arg) {
                       pipeline_job.job_id = next_job_num(jobs, job_count);
                       jobs[job_count++] = pipeline_job;
                     } else {
-                      int result =
-                          wait_for_child_poll(&pipeline_job, client_fd,
-                                              &pipeline_job.stdin_fd);
+                      int result = wait_for_child_poll(&pipeline_job, client_fd,
+                                                       &pipeline_job.stdin_fd);
 
                       if (result == -1) {
                         kill(-left_pid, SIGKILL);
@@ -1070,7 +1069,7 @@ void *handle_client(void *arg) {
                   close(fd_in);
                 }
 
-                umask(start_umask); // after the > open, so it stays 0664
+                umask(start_umask);      // after the > open, so it stays 0664
                 signal(SIGHUP, SIG_DFL); // undo the daemon's SIG_IGN
                 if (execvp(left_args[0], left_args) == -1) {
                   _exit(127);
@@ -1386,8 +1385,8 @@ int main(void) {
       continue; // out of memory
     socklen_t len = sizeof(conn->addr);
     // SOCK_CLOEXEC: other clients' commands don't inherit this socket
-    conn->fd = accept4(server_fd, (struct sockaddr *)&conn->addr, &len,
-                       SOCK_CLOEXEC);
+    conn->fd =
+        accept4(server_fd, (struct sockaddr *)&conn->addr, &len, SOCK_CLOEXEC);
 
     if (conn->fd == -1) {
       free(conn);
@@ -1395,7 +1394,13 @@ int main(void) {
     }
 
     pthread_t thread_id;
-    pthread_create(&thread_id, NULL, handle_client, conn);
+    if (pthread_create(&thread_id, NULL, handle_client, conn) != 0) {
+      perror("pthread_create error");
+      close(server_fd);
+      free(conn);
+      exit(EXIT_FAILURE);
+    }
+
     pthread_detach(thread_id);
   }
 
